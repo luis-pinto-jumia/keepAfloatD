@@ -8,10 +8,31 @@ export ROOT_DIR
 . "${ROOT_DIR}/tests/e2e/scripts/lib.sh"
 # shellcheck source=tests/e2e/scripts/report.sh
 . "${ROOT_DIR}/tests/e2e/scripts/report.sh"
+# shellcheck source=tests/e2e/scripts/command-observer.sh
+. "${ROOT_DIR}/tests/e2e/scripts/command-observer.sh"
 
 readonly SCENARIO_DIR="${ROOT_DIR}/tests/e2e/scenarios"
 
+selected_scenarios() {
+  local index="${E2E_SHARD_INDEX:-0}" count="${E2E_SHARD_COUNT:-1}"
+  if [[ ! "${index}" =~ ^(0|[1-9][0-9]{0,2})$ ]] ||
+    [[ ! "${count}" =~ ^[1-9][0-9]{0,2}$ ]] || (( index >= count )); then
+    printf 'Invalid E2E shard index/count: %s/%s\n' "${index}" "${count}" >&2
+    return 2
+  fi
+  local -a scenarios=("${SCENARIO_DIR}"/[0-9][0-9]_*.sh)
+  if (( count > ${#scenarios[@]} )); then
+    printf 'E2E shard count exceeds the number of scenarios\n' >&2
+    return 2
+  fi
+  local position
+  for ((position=index; position<${#scenarios[@]}; position+=count)); do
+    printf '%s\n' "${scenarios[position]}"
+  done
+}
+
 down_cluster() {
+  command_observer_stop
   compose down -v --remove-orphans
 }
 
@@ -19,6 +40,11 @@ run_scenario() {
   local scenario_path="${1:?scenario path required}"
   local scenario_name
   scenario_name="$(basename "${scenario_path}" .sh)"
+  local KEEPAFLOATD_E2E_CONFIG_DIR="${KEEPAFLOATD_E2E_CONFIG_DIR:-configs}"
+  if [[ "${scenario_name}" == 03_kill_leader ]]; then
+    KEEPAFLOATD_E2E_CONFIG_DIR=configs-continuity
+  fi
+  export KEEPAFLOATD_E2E_CONFIG_DIR
 
   log "starting ${scenario_name}"
   local status=0
@@ -32,9 +58,23 @@ run_scenario() {
   mkdir -p "${artifact_dir}"
 
   if {
-    reset_cluster &&
-      wait_for_steady_state &&
-      bash "${scenario_path}"
+    trap 'command_observer_stop' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    if reset_cluster &&
+        command_observer_start "${artifact_dir}" "${scenario_name}" &&
+        wait_for_startup_state &&
+        bash "${scenario_path}"; then
+      status=0
+    else
+      status=$?
+    fi
+    if ! command_observer_stop; then
+      log "command observation failed; inspect its artifacts"
+      (( status != 0 )) || status=1
+    fi
+    trap - EXIT
+    exit "${status}"
   } 2>&1 | tee "${run_log}"; then
     status=0
   else
@@ -53,13 +93,28 @@ run_scenario() {
 }
 
 run_all_scenarios() {
-  local -a passed=() failed=()
-  local scenario name
-  for scenario in "${SCENARIO_DIR}"/[0-9][0-9]_*.sh; do
+  local -a passed=() failed=() scenarios=()
+  local scenario name selection
+  selection="$(selected_scenarios)" || return
+  if [[ -z "${selection}" ]]; then
+    fail "no e2e scenarios selected"
+    return 1
+  fi
+  # Scenario commands may read stdin, so finish reading the list before running them.
+  mapfile -t scenarios <<<"${selection}"
+  for scenario in "${scenarios[@]}"; do
     name="$(basename "${scenario}" .sh)"
     if run_scenario "${scenario}"; then
       passed+=("${name}")
     else
+      failed+=("${name}")
+    fi
+  done
+
+  for scenario in "${scenarios[@]}"; do
+    name="$(basename "${scenario}" .sh)"
+    if [[ " ${passed[*]} ${failed[*]} " != *" ${name} "* ]]; then
+      fail "selected scenario has no result: ${name}"
       failed+=("${name}")
     fi
   done
@@ -69,6 +124,10 @@ run_all_scenarios() {
   local PASSED="${passed[*]}" FAILED="${failed[*]}"
   generate_report || log "report generation failed"
 
+  if (( ${#passed[@]} + ${#failed[@]} != ${#scenarios[@]} )); then
+    fail "e2e result count does not match the selection"
+    return 1
+  fi
   if (( ${#failed[@]} > 0 )); then
     fail "e2e scenarios failed: ${failed[*]}"
     return 1
@@ -77,10 +136,11 @@ run_all_scenarios() {
 
 usage() {
   cat <<EOF
-Usage: ${0##*/} [all|up|wait-ready|run|down|SCENARIO]
+Usage: ${0##*/} [all|list|up|wait-ready|run|down|SCENARIO]
 
 Commands:
   all         reset the stack, run all scenarios, and tear everything down
+  list        list selected scenarios without starting Docker
   up          start the compose stack in the background
   wait-ready  wait for the steady-state 3-node cluster
   run         run all scenarios against fresh stacks
@@ -90,12 +150,16 @@ Commands:
 'all' and 'run' execute every scenario (continuing past failures) and write a
 summary to e2e-artifacts/report.md; per-scenario logs land under
 e2e-artifacts/compose/<scenario>/.
+E2E_SHARD_INDEX (zero-based) and E2E_SHARD_COUNT select a disjoint subset.
 EOF
 }
 
 cmd="${1:-all}"
 
 case "${cmd}" in
+  list)
+    selected_scenarios
+    ;;
   all|run)
     trap 'down_cluster >/dev/null 2>&1 || true' EXIT
     run_all_scenarios
@@ -104,7 +168,7 @@ case "${cmd}" in
     reset_cluster
     ;;
   wait-ready)
-    wait_for_steady_state
+    wait_for_startup_state
     ;;
   down)
     down_cluster

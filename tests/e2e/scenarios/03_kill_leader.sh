@@ -12,7 +12,16 @@ export ROOT_DIR
 wait_for_single_agreed_leader 20
 old_leader_id="$(current_leader_id)"
 old_leader_svc="$(service_for_id "${old_leader_id}")"
-log "current leader is ${old_leader_svc} (id ${old_leader_id}); killing it"
+declare -A original_holders
+for vip in "${VIPS[@]}"; do
+  original_holders["${vip}"]="$(holder_for_vip "${vip}")"
+done
+assert_unique_holders
+continuity_checkpoint="$(log_checkpoint)" || {
+  fail "cannot capture pre-failure VIP continuity evidence"
+  exit 1
+}
+log "current leader is ${old_leader_svc} (id ${old_leader_id}); killing it at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 kill_service "${old_leader_svc}" KILL
 wait_for_service_exit "${old_leader_svc}" 10
@@ -22,9 +31,22 @@ wait_for_service_exit "${old_leader_svc}" 10
 wait_for_leader_other_than "${old_leader_id}" 30
 
 # VIPs re-collapse onto the two survivors: every VIP held exactly once, none dropped or duplicated.
-wait_until 30 all_vips_uniquely_held || {
+wait_until "$(cleanup_budget_seconds 30)" all_vips_uniquely_held || {
   dump_cluster_diagnostics
   fail "VIPs not uniquely held after leader kill (current: $(current_assignments_summary))"
   exit 1
 }
 assert_unique_holders
+
+for vip in "${VIPS[@]}"; do
+  before="${original_holders[${vip}]}"
+  [[ "${before}" == "${old_leader_svc}" ]] && continue
+  after="$(holder_for_vip "${vip}")"
+  [[ "${after}" == "${before}" ]] || {
+    dump_cluster_diagnostics
+    fail "leader loss moved healthy survivor VIP ${vip} from ${before} to ${after}"
+    exit 1
+  }
+  assert_vip_continuity_after "${continuity_checkpoint}" "${before}" "${vip}"
+done
+log "healthy survivors retained their VIPs without removal during leader failover"

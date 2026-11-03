@@ -5,19 +5,28 @@
 
 node_id: 1
 
-# Cluster formation is automatic and needs no special node: on startup nodes probe each other and,
-# once a majority is reachable and no cluster exists, each node initializes with the identical
-# `peers` roster (safe per OpenRaft) and Raft elects one leader. Any majority can form or recover
-# the cluster, even if the lowest-id node is down (suits diskless/PXE nodes with no saved state).
+# Cluster formation is automatic and needs no special node. Each process starts with a fresh boot
+# identity and observes restart quarantine. Cold formation needs consent from every proposed boot
+# and reservations from a majority of configured physical members. Verified admission permits Raft
+# initialization with that exact genesis cohort, not the entire `peers` roster. A replacement boot
+# joins existing history as a learner before committed promotion. Majority recovery does not require
+# the lowest-id node. See docs/runtime-admission.md for the clock, cleanup and recovery assumptions.
+# VIP activation has a separate safety delay after admission. The startup_safety_wait_ms log field
+# is a lower bound, not readiness; verify formation, health and unique VIP ownership separately.
+# Current peers also compare a versioned fingerprint of every non-secret cluster-wide setting
+# before Raft dispatch. Keep the roster, VIPs, health timing, failover/failback policy, frame cap,
+# and Raft timing identical. Mutual HMAC authentication checks key possession separately.
 
 # Bind Raft and the leader-side submit listener to the same peer-reachable addresses advertised
 # below in this node's `peers` entry. Avoid `0.0.0.0`: the bind/listen addresses are validated
-# against `peers[node_id]`, and a wider bind plus a missing `cluster_secret` would let any host on
-# the segment forge HealthUpdate envelopes.
+# against `peers[node_id]`; a wider bind would expose both authenticated control-plane listeners
+# to every host on the segment.
 raft_listen: "127.0.0.1:7000"
 client_submit_listen: "127.0.0.1:7001"
 
 peers:
+  # Use one IP family throughout every raft_address roster and throughout every
+  # client_submit_address roster; outbound sockets bind to the advertised local IP.
   - id: 1
     raft_address: "127.0.0.1:7000"
     client_submit_address: "127.0.0.1:7001"
@@ -28,13 +37,19 @@ peers:
     raft_address: "127.0.0.1:7020"
     client_submit_address: "127.0.0.1:7021"
 
-# Virtual IPs to distribute across healthy voters. `address` takes an optional CIDR
-# suffix (`10.0.0.101/24`); without one the VIP is bound as a host route (`/32` for IPv4,
+# Virtual IPs to distribute across healthy voters. `address` takes an optional keepalived-style
+# CIDR suffix (`10.0.0.101/24`); without one the VIP is bound as a host route (`/32` for IPv4,
 # `/128` for IPv6), which is the usual choice. The prefix must match how the address is reachable on
 # `interface`. This list must be identical on every node.
 #
-# Optional: `vlan` (IEEE 802.1Q tag, 1–4094). When set, `ip addr` targets `{interface}.{vlan}`
+# Optional: `vlan` (IEEE 802.1Q tag, 1-4094). When set, `ip addr` targets `{interface}.{vlan}`
 # (e.g. `eth0.100`). The sub-interface must already exist; keepafloatd does not create VLANs.
+# keepafloatd records every bound address as a `throw` host route in dedicated policy table
+# `10000 + address_protocol` with the node-local protocol configured below. Startup removes exact
+# marked crash orphans even when they no longer appear here, but never discovers unmarked or
+# differently marked addresses for deletion. When upgrading from an older unmarked release,
+# restart every node with the old VIP list first; remove VIPs only after the derived table's numeric
+# JSON route output reports the configured protocol for each live address.
 vips:
   - address: "10.0.0.101/24"
     interface: eth0
@@ -47,10 +62,14 @@ vips:
 health:
   command: ["/bin/true"]
   interval_ms: 2000
+  # Must be strictly below the effective stale window; leave room for publishing the result.
   timeout_ms: 5000
   # A peer whose committed probe rounds stop advancing for longer than this window is excluded
   # from VIP eligibility. This is what triggers failover when a node dies silently or gets
   # partitioned before it can publish `healthy: false`. Must be >= ceil(interval_ms / 1000).
+  # Config identity uses the resulting whole missed-probe threshold, not unused fractional time.
+  # The effective window is interval_ms * floor(stale_secs * 1000 / interval_ms).
+  # Startup rejects a timeout at or above that window.
   stale_secs: 10
 
 raft:
@@ -58,40 +77,59 @@ raft:
   election_timeout_max_ms: 800
   heartbeat_interval_ms: 250
 
-# Pre-shared cluster secret. MUST be identical on every member, MUST be unique per cluster, and
-# MUST be kept out of attacker reach (root-owned 0600 file). Omit the field entirely to disable
-# authentication on a fully trusted network.
+# Configure exactly one secret source: inline or cluster_secret_file.
+# Use 32 to 256 UTF-8 bytes without whitespace or controls, identical on
+# every member and unique per cluster, for example `openssl rand -hex 32`.
+# Keep secret-bearing files root-owned and mode 0600. This placeholder is invalid.
 cluster_secret: "replace-me-with-a-random-32-byte-string"
+# Alternatively remove cluster_secret and set cluster_secret_file: "cluster.secret".
+# Relative paths resolve against this config's directory. A regular UTF-8
+# file may end in one LF or CRLF; changes require a daemon restart.
 
-# Refuse RPC frames larger than this (defaults to 4 MiB; minimum 64 KiB). Protects against a
-# rogue or buggy peer trying to allocate a 4 GiB buffer via a u32 length prefix.
+# Refuse Raft/snapshot frames larger than this (defaults to 4 MiB; allowed range 64 KiB-16 MiB).
+# Submit requests use a separate fixed 4 KiB cap. These limits stop a rogue or buggy peer from
+# forcing an allocation directly from an arbitrary u32 length prefix.
 max_frame_bytes: 4194304
 
 # Wall-clock budget on a single submit attempt, including local leader writes and
 # follower->leader forwards (defaults to 2000 ms).
 submit_timeout_ms: 2000
 
+# Linux route-protocol ownership marker for crash-orphan discovery (1-255; default 246). The marker
+# is a `throw` host route in dedicated policy table `10000 + address_protocol`. Assign a distinct
+# value to every co-located keepafloatd instance; reserve its derived table from other routes and
+# `ip rule` entries in the same network namespace. Keep it stable across restarts. Before changing
+# it, gracefully stop the old process and verify no old marker remains; after a crash, restart once
+# with the old value or clean its address and derived-table marker manually. It does not affect
+# cluster identity.
+address_protocol: 246
+
 dry_run: false
 
 # Optional notify script called when this node gains or releases a VIP (keepalived-compatible).
 # Invoked as: <script> INSTANCE <vip_address> MASTER|BACKUP|FAULT
-# MASTER — this node just acquired the VIP.
-# BACKUP — this node released the VIP to another healthy node.
-# FAULT  — this node released the VIP because its own health check failed.
+# MASTER - this node just acquired the VIP.
+# BACKUP - this node released the VIP to another healthy node.
+# FAULT - this node released the VIP because its own health check failed.
 # The script runs fire-and-forget; a non-zero exit is logged but does not affect failover.
 # This is a per-node field and may differ between cluster members.
 # notify: /etc/keepafloatd/notify.sh
 
+# Minimum time (seconds) an established healthy node's probe must fail continuously before the
+# failure is published and its VIPs are released. A successful probe resets the timer. Default: 0
+# (immediate failover). A node that has never passed a probe remains unhealthy immediately.
+# failover_delay_secs: 0
+
 # Whether a recovered node is allowed to reclaim VIPs it previously held (analogous to
 # keepalived's `preempt` / `nopreempt`).
-#   true  (default) — recovered nodes re-enter the eligible pool after `failback_delay_secs`.
-#   false           — once a node goes unhealthy it is permanently blocked from holding VIPs
-#                     until the entire cluster is fully reformed (all nodes restart from scratch
-#                     without an existing snapshot). Restarting a single daemon is not enough
-#                     because the block is replicated via Raft snapshot (nopreempt behaviour).
+#   true  (default) - recovered nodes re-enter the eligible pool after `failback_delay_secs`.
+#   false (nopreempt) - a recovered node does not take VIPs from healthy holders, but remains
+#                       eligible for an orphaned VIP when a current holder fails. This suppresses
+#                       automatic failback without sacrificing failover capacity.
 # failback: true
 
 # Minimum time (seconds) a recovered node must remain healthy before it can take back VIPs.
 # Only meaningful when `failback: true`. Converted internally to probe-round counts so the
-# state machine stays deterministic (no wall-clock reads). Default: 10.
+# state machine stays deterministic (no wall-clock reads). When `failback: false`, this value is
+# ignored and excluded from the effective cluster configuration identity. Default: 10.
 # failback_delay_secs: 10

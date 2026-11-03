@@ -2,7 +2,7 @@
 name = "keepafloatd"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.88"
 description = "keepAfloatD - VIP failover daemon using OpenRaft"
 license = "AGPL-3.0-only" # Commercial licensing is also available; see LICENSE.
 repository = "https://github.com/croit/keepAfloatD"
@@ -14,7 +14,7 @@ path = "src/main.rs"
 [package.metadata.deb]
 maintainer = "croit GmbH <support@croit.io>"
 copyright = "2026, croit GmbH. GNU AGPL v3 for community usage; commercial licensing available from croit.io."
-depends = "$auto, iproute2, iputils-arping, ca-certificates"
+depends = "$auto, iproute2, iputils-arping, libndp-tools (>= 1.8), ca-certificates"
 section = "net"
 priority = "optional"
 maintainer-scripts = "deploy/debian/"
@@ -24,8 +24,9 @@ assets = [
   ["LICENSE", "usr/share/doc/keepafloatd/LICENSE", "644"],
   ["LICENSES/AGPL-3.0.txt", "usr/share/doc/keepafloatd/licenses/AGPL-3.0.txt", "644"],
   ["LICENSES/COMMERCIAL.md", "usr/share/doc/keepafloatd/licenses/COMMERCIAL.md", "644"],
+  ["LICENSES/subtle-2.6.1.txt", "usr/share/doc/keepafloatd/licenses/subtle-2.6.1.txt", "644"],
   ["THIRD_PARTY_LICENSES.md", "usr/share/doc/keepafloatd/THIRD_PARTY_LICENSES.md", "644"],
-  ["config.example.yaml", "etc/keepafloatd/config.yaml", "644"],
+  ["config.example.yaml", "etc/keepafloatd/config.yaml", "600"],
   ["deploy/default/keepafloatd", "etc/default/keepafloatd", "644"],
 ]
 systemd-units = { unit-name = "keepafloatd", unit-scripts = "deploy/systemd/", enable = false, start = false, restart-after-upgrade = false }
@@ -33,14 +34,16 @@ systemd-units = { unit-name = "keepafloatd", unit-scripts = "deploy/systemd/", e
 # RPM packaging via cargo-generate-rpm (el9+). Mirrors the deb asset layout above.
 [package.metadata.generate-rpm]
 summary = "keepAfloatD - VIP failover daemon using OpenRaft"
+post_install_script = "deploy/rpm/postinst"
 assets = [
   { source = "target/release/keepafloatd", dest = "/usr/bin/keepafloatd", mode = "755" },
   { source = "README.md", dest = "/usr/share/doc/keepafloatd/README.md", mode = "644" },
   { source = "LICENSE", dest = "/usr/share/doc/keepafloatd/LICENSE", mode = "644" },
   { source = "LICENSES/AGPL-3.0.txt", dest = "/usr/share/doc/keepafloatd/licenses/AGPL-3.0.txt", mode = "644" },
   { source = "LICENSES/COMMERCIAL.md", dest = "/usr/share/doc/keepafloatd/licenses/COMMERCIAL.md", mode = "644" },
+  { source = "LICENSES/subtle-2.6.1.txt", dest = "/usr/share/doc/keepafloatd/licenses/subtle-2.6.1.txt", mode = "644" },
   { source = "THIRD_PARTY_LICENSES.md", dest = "/usr/share/doc/keepafloatd/THIRD_PARTY_LICENSES.md", mode = "644" },
-  { source = "config.example.yaml", dest = "/etc/keepafloatd/config.yaml", mode = "644", config = true },
+  { source = "config.example.yaml", dest = "/etc/keepafloatd/config.yaml", mode = "600", config = "noreplace", user = "root", group = "root" },
   { source = "deploy/default/keepafloatd", dest = "/etc/default/keepafloatd", mode = "644", config = true },
   { source = "deploy/systemd/keepafloatd@.service", dest = "/usr/lib/systemd/system/keepafloatd@.service", mode = "644" },
 ]
@@ -48,17 +51,45 @@ assets = [
 # el9/Fedora name the package "iproute" (iproute2 is the Debian name).
 iproute = "*"
 iputils = "*"
+libndp = ">= 1.8"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
+serde_yaml = { package = "yaml_serde", version = "=0.10.7" }
 serde_json = "1"
-anyhow = "1"
+anyhow = "1.0.103"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 # Pinned exactly: 0.10 is an alpha; the storage/network trait surface can churn between alphas.
-# The I/O-progress redesign in 0.10 is what fixes the diskless restart-past-snapshot crash (bug 6).
-openraft = { version = "=0.10.0-alpha.25", features = ["serde", "type-alias"] }
+# The I/O-progress redesign in 0.10 fixes the diskless restart-past-snapshot crash.
+openraft = { version = "=0.10.0-alpha.37", features = ["serde", "type-alias"] }
 futures = "0.3"
+# Collision-resistant, versioned identity for cluster-wide configuration invariants.
+sha2 = "0.10"
+# Reviewed HMAC and constant-time tag verification; never implement our own MAC.
+hmac = "0.12"
+# Reuse the locked OS-entropy API instead of adding a userspace RNG.
+getrandom = "0.4.3"
+# Linux process-group termination for cancellation-safe health probes.
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+# OpenRaft alpha.37's generic RaftCore exceeds Rust's 2 MiB test-thread stack
+# when downstream monomorphizations are completely unoptimized.
+[profile.test]
+opt-level = 1

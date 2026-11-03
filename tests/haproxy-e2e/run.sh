@@ -8,6 +8,8 @@ readonly COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-keepafloatd-haproxy-e2e}"
 readonly ARTIFACT_DIR="${ARTIFACT_DIR:-${ROOT_DIR}/e2e-artifacts/haproxy-e2e}"
 readonly -a NODES=("node-a" "node-b" "node-c")
 readonly -a VIPS=("10.50.0.100" "10.50.0.101" "10.50.0.102")
+# shellcheck source=tests/e2e/scripts/startup-budget.sh
+. "${ROOT_DIR}/tests/e2e/scripts/startup-budget.sh"
 # No fixed expected-assignment arrays: the minimal-movement assignment guarantees an even spread
 # but not a fixed placement (holder identity is leader- and history-dependent), so we assert the
 # even-spread shape via even_over_nodes(), not specific holders.
@@ -23,6 +25,13 @@ fail() {
 
 compose() {
     docker compose -f "${COMPOSE_FILE}" -p "${COMPOSE_PROJECT_NAME}" "$@"
+}
+
+service_logs_contain() {
+    local service="${1:?service required}" pattern="${2:?pattern required}"
+    local logs
+    logs="$(compose logs --no-color "${service}")" || return 1
+    grep -E -q "${pattern}" <<<"${logs}"
 }
 
 node_sh() {
@@ -217,6 +226,17 @@ cleanup() {
 
 trap cleanup EXIT
 
+verify_node_image_binary() {
+    local expected actual
+    expected="$(sha256sum target/release/keepafloatd | awk '{print $1}')"
+    actual="$(docker run --rm --entrypoint sha256sum \
+        keepafloatd-haproxy-e2e-node:local /usr/local/bin/keepafloatd | awk '{print $1}')"
+    [[ "${actual}" == "${expected}" ]] || {
+        fail "HAProxy node image does not contain the exact current release binary"
+        return 1
+    }
+}
+
 log "building release binary for HAProxy article lab"
 cargo build --release
 
@@ -227,6 +247,7 @@ rustc tests/haproxy-e2e/haproxy.rs -O -o target/haproxy-e2e/haproxy
 log "preparing compact node build context"
 rm -rf target/haproxy-e2e/docker-context
 mkdir -p target/haproxy-e2e/docker-context/configs
+cp target/release/keepafloatd target/haproxy-e2e/docker-context/keepafloatd
 cp target/haproxy-e2e/haproxy target/haproxy-e2e/docker-context/haproxy
 cp tests/haproxy-e2e/entrypoint.sh target/haproxy-e2e/docker-context/entrypoint.sh
 cp tests/haproxy-e2e/node.Dockerfile target/haproxy-e2e/docker-context/Dockerfile
@@ -234,13 +255,14 @@ cp tests/haproxy-e2e/configs/*.yaml target/haproxy-e2e/docker-context/configs/
 
 log "building node image"
 DOCKER_BUILDKIT=0 docker build --pull=false -t keepafloatd-haproxy-e2e-node:local target/haproxy-e2e/docker-context
+verify_node_image_binary
 
 log "starting HAProxy article lab"
 compose down -v --remove-orphans >/dev/null 2>&1 || true
 compose up -d
 
 log "waiting for steady-state VIP distribution"
-wait_for_even_over_nodes 30 "${NODES[@]}"
+wait_for_startup_over_nodes 30 "${NODES[@]}"
 wait_until 20 assert_all_vips_http_ok || {
     fail "VIP HTTP checks did not become healthy in steady state"
     exit 1

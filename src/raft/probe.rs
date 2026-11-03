@@ -1,34 +1,45 @@
-//! Cluster-status probe used for automatic cluster formation.
+//! Read-only discovery for the admission controller, available during quarantine.
 //!
-//! On startup a node asks its peers whether a cluster already exists. If none does and a majority
-//! of the roster is reachable, the node calls `Raft::initialize` with the full, cluster-wide
-//! identical membership. OpenRaft documents concurrent `initialize` with the *same* config as
-//! safe, so **every** node may do this and Raft elects a single leader among the reachable
-//! majority — no node is special, so any majority can form (or recover) the cluster even if the
-//! lowest-id node is permanently down. If a cluster already exists, the node joins via replication
-//! instead. See [`crate::raft::auto_form_cluster`] for the orchestration and the safety model.
+//! Status can identify a reachable boot and report its observed history. Neither reachability
+//! nor a reported leader authorizes initialization, voting, learner admission or renewal.
+//! Those decisions require the admission controller and a checked process-local session.
 //!
 //! The probe travels over the same TCP transport and handshake (node-id + `cluster_secret` +
 //! peer-id gate) as Raft RPCs, so it is authenticated identically. The request/response structs
-//! carry **required** fields so they cannot be confused with the OpenRaft RPC frames by the
-//! try-all-deserialization dispatcher in [`super::network`].
+//! are payloads inside the explicit `status` operation envelope. Protocol version and operation
+//! validation happen before the dispatcher handles a status or OpenRaft RPC payload.
 
+use crate::config::ClusterConfigFingerprint;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Asks a peer to report whether it is already part of a formed cluster.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClusterStatusRequest {
     /// `node_id` of the asking node (diagnostic / symmetry with the handshake).
     pub probe_from: u64,
+    /// Canonical identity of the asking node's cluster-wide settings. Missing means a legacy peer.
+    #[serde(default)]
+    pub config_fingerprint: Option<ClusterConfigFingerprint>,
+    /// Whether the asking binary drops an RPC stream when its in-flight request is cancelled.
+    /// Missing means a legacy reader that may retain a complete unread response.
+    #[serde(default)]
+    pub supports_cancellation_safe_rpc_v1: bool,
 }
 
 /// A peer's answer to [`ClusterStatusRequest`], computed from its local Raft state.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClusterStatusResponse {
+    /// Authenticated responder boot, filled from the handshake, never trusted from status JSON.
+    #[serde(skip)]
+    pub replica: Option<super::admission::ReplicaId>,
+    /// Whether this peer handles the distinct, read-only Pre-Vote envelope.
+    #[serde(default)]
+    pub supports_pre_vote: bool,
     /// True once `Raft::initialize` (or replicated membership) has taken effect locally.
     pub initialized: bool,
     /// Current leader as seen by the responder, if any.
-    pub current_leader: Option<u64>,
+    pub current_leader: Option<super::admission::ReplicaId>,
     /// Number of voters in the responder's committed membership (0 when uninitialized).
     pub member_count: usize,
     /// The responder's committed cluster incarnation, if it has one yet (`None` until the first
@@ -37,17 +48,102 @@ pub struct ClusterStatusResponse {
     /// `#[serde(default)]` keeps the probe decodable from peers that predate the field.
     #[serde(default)]
     pub cluster_epoch: Option<u128>,
+    /// Whether this binary can apply and enforce failover semantics V2. Missing means legacy.
+    #[serde(default)]
+    pub supports_failover_semantics_v2: bool,
+    /// Canonical identity of the responder's cluster-wide settings. Missing means a legacy peer.
+    #[serde(default)]
+    pub config_fingerprint: Option<ClusterConfigFingerprint>,
+    /// Whether this binary can enforce configuration identity on Raft streams.
+    #[serde(default)]
+    pub supports_config_identity_v1: bool,
+    /// Whether the replicated cluster state now requires every peer to advertise an identity.
+    #[serde(default)]
+    pub config_identity_enforced: bool,
+}
+
+/// Concrete mismatches are always rejected. A missing identity is accepted only during a rolling
+/// upgrade, before the cluster commits identity enforcement.
+#[must_use]
+pub fn config_identity_compatible(
+    local: ClusterConfigFingerprint,
+    peer: Option<ClusterConfigFingerprint>,
+    enforcement_active: bool,
+) -> bool {
+    match peer {
+        Some(peer) => local == peer,
+        None => !enforcement_active,
+    }
+}
+
+/// Size of the largest exact non-local identity group. Distinct foreign fingerprints never add
+/// together: only one coherent alternative configuration can prove this node is the minority.
+#[must_use]
+pub fn largest_foreign_identity_group(
+    local: ClusterConfigFingerprint,
+    identities: impl IntoIterator<Item = Option<ClusterConfigFingerprint>>,
+) -> usize {
+    let mut groups = BTreeMap::<ClusterConfigFingerprint, usize>::new();
+    for identity in identities
+        .into_iter()
+        .flatten()
+        .filter(|value| *value != local)
+    {
+        *groups.entry(identity).or_default() += 1;
+    }
+    groups.values().copied().max().unwrap_or(0)
+}
+
+/// Size of the largest exact non-local cluster-incarnation group. A reset is justified only by
+/// one coherent replacement cluster; unrelated foreign epochs must never add into a quorum (#31).
+#[must_use]
+pub fn largest_foreign_epoch_group(
+    local: Option<u128>,
+    epochs: impl IntoIterator<Item = Option<u128>>,
+) -> usize {
+    let Some(local) = local else {
+        return 0;
+    };
+    let mut groups = BTreeMap::<u128, usize>::new();
+    for epoch in epochs.into_iter().flatten().filter(|value| *value != local) {
+        *groups.entry(epoch).or_default() += 1;
+    }
+    groups.values().copied().max().unwrap_or(0)
+}
+
+/// Consecutive-round hold-down for a quorum observation. A below-majority round resets progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsecutiveMajority {
+    strikes: u32,
+    required: u32,
+}
+
+impl ConsecutiveMajority {
+    #[must_use]
+    pub const fn new(required: u32) -> Self {
+        Self {
+            strikes: 0,
+            required,
+        }
+    }
+
+    /// Record one round and return true once the configured hold-down has been satisfied.
+    pub fn observe(&mut self, largest_group: usize, majority: usize) -> bool {
+        if largest_group >= majority {
+            self.strikes = self.strikes.saturating_add(1);
+        } else {
+            self.strikes = 0;
+        }
+        self.strikes >= self.required
+    }
+
+    #[must_use]
+    pub const fn strikes(&self) -> u32 {
+        self.strikes
+    }
 }
 
 impl ClusterStatusResponse {
-    /// True when the responder is part of an existing cluster (initialized or already sees a
-    /// leader). A `true` here means the asking node must **not** form a new cluster and should
-    /// instead join as a follower via normal replication.
-    #[must_use]
-    pub fn indicates_existing_cluster(&self) -> bool {
-        self.initialized || self.current_leader.is_some()
-    }
-
     /// True when the responder reports a *concrete* incarnation that differs from `mine`. A `None`
     /// responder (blank / pre-first-commit) is never "foreign": it may still be mid-formation and
     /// will be absorbed by replication. Comparing two `None`s is likewise not foreign.
@@ -60,90 +156,136 @@ impl ClusterStatusResponse {
     }
 }
 
-/// The action a node takes after one probe round during formation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FormationDecision {
-    /// An existing cluster was found; join via replication instead of initializing.
-    Join,
-    /// A majority responded uninitialized; safe to call `Raft::initialize`.
-    Form,
-    /// Not enough peers reachable yet; keep probing (never form a sub-majority cluster).
-    Wait,
-}
-
-/// Decide the next formation action from one probe round's results.
-///
-/// `total_peers` is the full roster size (including self). `reachable_uninit` counts this node
-/// itself plus every peer that answered and reported no existing cluster. `found_existing` is true
-/// when any peer reported an existing cluster.
-#[must_use]
-pub fn formation_decision(
-    total_peers: usize,
-    reachable_uninit: usize,
-    found_existing: bool,
-) -> FormationDecision {
-    if found_existing {
-        return FormationDecision::Join;
-    }
-    let majority = total_peers / 2 + 1;
-    if reachable_uninit >= majority {
-        FormationDecision::Form
-    } else {
-        FormationDecision::Wait
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ClusterConfigFingerprint;
+
+    fn fingerprint(byte: u8) -> ClusterConfigFingerprint {
+        ClusterConfigFingerprint {
+            version: 1,
+            digest: [byte; 32],
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct LegacyStatusRequest {
+        probe_from: u64,
+    }
+
+    #[test]
+    fn concrete_config_mismatch_is_never_compatible() {
+        assert!(config_identity_compatible(
+            fingerprint(1),
+            Some(fingerprint(1)),
+            false
+        ));
+        assert!(!config_identity_compatible(
+            fingerprint(1),
+            Some(fingerprint(2)),
+            false
+        ));
+        assert!(!config_identity_compatible(
+            fingerprint(1),
+            Some(ClusterConfigFingerprint {
+                version: 2,
+                digest: [1; 32],
+            }),
+            false
+        ));
+    }
+
+    #[test]
+    fn missing_legacy_identity_is_allowed_only_before_activation() {
+        assert!(config_identity_compatible(fingerprint(1), None, false));
+        assert!(!config_identity_compatible(fingerprint(1), None, true));
+    }
 
     #[test]
     fn status_request_roundtrip() {
-        let req = ClusterStatusRequest { probe_from: 7 };
+        let req = ClusterStatusRequest {
+            probe_from: 7,
+            config_fingerprint: Some(fingerprint(1)),
+            supports_cancellation_safe_rpc_v1: true,
+        };
         let v = serde_json::to_vec(&req).unwrap();
         assert_eq!(
             serde_json::from_slice::<ClusterStatusRequest>(&v).unwrap(),
             req
         );
+        assert_eq!(
+            serde_json::from_slice::<LegacyStatusRequest>(&v)
+                .unwrap()
+                .probe_from,
+            7
+        );
+        let legacy: ClusterStatusRequest = serde_json::from_str(r#"{"probe_from":7}"#).unwrap();
+        assert_eq!(legacy.config_fingerprint, None);
+        assert!(!legacy.supports_cancellation_safe_rpc_v1);
     }
 
     #[test]
-    fn status_response_roundtrip_and_predicate() {
+    fn status_response_roundtrip_preserves_protocol_fields() {
         let resp = ClusterStatusResponse {
+            replica: None,
+            supports_pre_vote: true,
             initialized: true,
-            current_leader: Some(2),
+            current_leader: Some(crate::raft::types::test_replica(2)),
             member_count: 3,
             cluster_epoch: Some(42),
+            supports_failover_semantics_v2: true,
+            config_fingerprint: Some(fingerprint(1)),
+            supports_config_identity_v1: true,
+            config_identity_enforced: true,
         };
         let v = serde_json::to_vec(&resp).unwrap();
         assert_eq!(
             serde_json::from_slice::<ClusterStatusResponse>(&v).unwrap(),
             resp
         );
-        assert!(resp.indicates_existing_cluster());
 
         let blank = ClusterStatusResponse {
+            replica: None,
+            supports_pre_vote: true,
             initialized: false,
             current_leader: None,
             member_count: 0,
             cluster_epoch: None,
+            supports_failover_semantics_v2: true,
+            config_fingerprint: Some(fingerprint(1)),
+            supports_config_identity_v1: true,
+            config_identity_enforced: false,
         };
-        assert!(!blank.indicates_existing_cluster());
+        assert_eq!(
+            serde_json::from_slice::<ClusterStatusResponse>(&serde_json::to_vec(&blank).unwrap())
+                .unwrap(),
+            blank
+        );
 
         // A probe from a peer that predates `cluster_epoch` (key absent) still decodes, as `None`.
         let legacy: ClusterStatusResponse =
-            serde_json::from_str(r#"{"initialized":true,"current_leader":2,"member_count":3}"#)
+            serde_json::from_str(r#"{"initialized":true,"current_leader":null,"member_count":3}"#)
                 .unwrap();
         assert_eq!(legacy.cluster_epoch, None);
+        assert!(!legacy.supports_failover_semantics_v2);
+        assert_eq!(legacy.config_fingerprint, None);
+        assert!(!legacy.supports_config_identity_v1);
+        assert!(!legacy.config_identity_enforced);
     }
 
     #[test]
     fn reports_foreign_epoch_only_when_both_concrete_and_different() {
         let with = |e| ClusterStatusResponse {
+            replica: None,
+            supports_pre_vote: true,
             initialized: true,
-            current_leader: Some(1),
+            current_leader: Some(crate::raft::types::test_replica(1)),
             member_count: 3,
             cluster_epoch: e,
+            supports_failover_semantics_v2: true,
+            config_fingerprint: Some(fingerprint(1)),
+            supports_config_identity_v1: true,
+            config_identity_enforced: true,
         };
         // Different concrete incarnations -> foreign.
         assert!(with(Some(2)).reports_foreign_epoch(Some(1)));
@@ -156,88 +298,52 @@ mod tests {
     }
 
     #[test]
-    fn formation_waits_below_majority_and_forms_at_majority() {
-        // 3-node cluster: majority is 2.
-        assert_eq!(formation_decision(3, 1, false), FormationDecision::Wait);
-        assert_eq!(formation_decision(3, 2, false), FormationDecision::Form);
-        assert_eq!(formation_decision(3, 3, false), FormationDecision::Form);
-        // 5-node cluster: majority is 3.
-        assert_eq!(formation_decision(5, 2, false), FormationDecision::Wait);
-        assert_eq!(formation_decision(5, 3, false), FormationDecision::Form);
-        // Single-node cluster forms immediately.
-        assert_eq!(formation_decision(1, 1, false), FormationDecision::Form);
+    fn foreign_majority_requires_one_exact_identity_group() {
+        let local = fingerprint(1);
+        assert_eq!(
+            largest_foreign_identity_group(local, [Some(fingerprint(2)), Some(fingerprint(2))]),
+            2
+        );
+        assert_eq!(
+            largest_foreign_identity_group(local, [Some(fingerprint(2)), Some(fingerprint(3))]),
+            1
+        );
+        assert_eq!(
+            largest_foreign_identity_group(local, [Some(local), None, Some(fingerprint(2))]),
+            1
+        );
     }
 
     #[test]
-    fn formation_joins_when_existing_cluster_found() {
-        // An existing cluster always means join, regardless of how many answered uninitialized.
-        assert_eq!(formation_decision(3, 1, true), FormationDecision::Join);
-        assert_eq!(formation_decision(3, 3, true), FormationDecision::Join);
+    fn foreign_epoch_majority_requires_one_exact_incarnation() {
+        assert_eq!(
+            largest_foreign_epoch_group(Some(1), [Some(2), Some(2), Some(3)]),
+            2
+        );
+        assert_eq!(
+            largest_foreign_epoch_group(Some(1), [Some(2), Some(2), Some(2)]),
+            3
+        );
+        assert_eq!(
+            largest_foreign_epoch_group(Some(1), [Some(1), None, Some(2)]),
+            1
+        );
+        assert_eq!(
+            largest_foreign_epoch_group(None, [Some(2), Some(2), Some(2)]),
+            0
+        );
     }
 
     #[test]
-    fn formation_majority_threshold_across_roster_sizes() {
-        // For each roster size, Wait strictly below majority, Form at and above it.
-        for total in 1..=7_usize {
-            let majority = total / 2 + 1;
-            for reachable in 0..=total {
-                let decision = formation_decision(total, reachable, false);
-                if reachable >= majority {
-                    assert_eq!(
-                        decision,
-                        FormationDecision::Form,
-                        "total={total} reachable={reachable} majority={majority}"
-                    );
-                } else {
-                    assert_eq!(
-                        decision,
-                        FormationDecision::Wait,
-                        "total={total} reachable={reachable} majority={majority}"
-                    );
-                }
-            }
-        }
-    }
+    fn foreign_majority_requires_consecutive_coherent_quorum_rounds() {
+        let mut guard = ConsecutiveMajority::new(3);
+        assert!(!guard.observe(1, 2));
+        assert!(!guard.observe(2, 2));
+        assert!(!guard.observe(2, 2));
+        assert!(guard.observe(2, 2));
 
-    #[test]
-    fn formation_even_sized_rosters_need_strict_majority() {
-        // 4-node: majority 3 (a 2-2 split must NOT form on either side).
-        assert_eq!(formation_decision(4, 2, false), FormationDecision::Wait);
-        assert_eq!(formation_decision(4, 3, false), FormationDecision::Form);
-        // 6-node: majority 4.
-        assert_eq!(formation_decision(6, 3, false), FormationDecision::Wait);
-        assert_eq!(formation_decision(6, 4, false), FormationDecision::Form);
-    }
-
-    #[test]
-    fn formation_existing_cluster_always_joins_regardless_of_reachability() {
-        for total in 1..=7_usize {
-            for reachable in 0..=total {
-                assert_eq!(
-                    formation_decision(total, reachable, true),
-                    FormationDecision::Join,
-                    "total={total} reachable={reachable}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn leader_seen_but_uninitialized_still_indicates_existing_cluster() {
-        let leader_only = ClusterStatusResponse {
-            initialized: false,
-            current_leader: Some(2),
-            member_count: 0,
-            cluster_epoch: None,
-        };
-        assert!(leader_only.indicates_existing_cluster());
-        let initialized_no_leader = ClusterStatusResponse {
-            initialized: true,
-            current_leader: None,
-            member_count: 3,
-            cluster_epoch: None,
-        };
-        assert!(initialized_no_leader.indicates_existing_cluster());
+        assert!(!guard.observe(1, 2));
+        assert_eq!(guard.strikes(), 0);
     }
 
     #[test]
@@ -246,11 +352,18 @@ mod tests {
         use super::super::types::TypeConfig;
         use openraft::alias::VoteOf;
         use openraft::raft::VoteRequest;
-        let vote: VoteRequest<TypeConfig> = VoteRequest::new(VoteOf::<TypeConfig>::new(1, 1), None);
+        let vote: VoteRequest<TypeConfig> = VoteRequest::new(
+            VoteOf::<TypeConfig>::new(1, crate::raft::types::test_replica(1)),
+            None,
+        );
         let v = serde_json::to_vec(&vote).unwrap();
         assert!(serde_json::from_slice::<ClusterStatusRequest>(&v).is_err());
         // And a probe must not be mistaken for a Vote frame.
-        let req = ClusterStatusRequest { probe_from: 1 };
+        let req = ClusterStatusRequest {
+            probe_from: 1,
+            config_fingerprint: Some(fingerprint(1)),
+            supports_cancellation_safe_rpc_v1: true,
+        };
         let pv = serde_json::to_vec(&req).unwrap();
         assert!(serde_json::from_slice::<VoteRequest<TypeConfig>>(&pv).is_err());
     }

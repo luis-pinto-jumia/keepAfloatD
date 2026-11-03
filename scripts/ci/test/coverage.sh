@@ -6,5 +6,8 @@ set -eu
 WORKDIR="${CI_PROJECT_DIR:-/app}"
 cd "${WORKDIR}"
 
-cargo tarpaulin --all-targets --out Xml --output-dir coverage
+# Merge both mandatory test groups before enforcing the unchanged coverage floors.
+cargo tarpaulin --config scripts/ci/test/coverage.toml
+./scripts/ci/test/coverage-per-file-test.sh
+./scripts/ci/test/coverage-per-file.sh coverage/cobertura.xml
 cp coverage/cobertura.xml "${WORKDIR}/cobertura.xml"

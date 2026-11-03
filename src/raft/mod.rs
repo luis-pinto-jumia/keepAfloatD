@@ -1,53 +1,82 @@
 //! Raft cluster (OpenRaft 0.10) over a small TCP/JSON framing layer.
 
+pub mod admission;
+mod control;
+mod guard;
 pub mod network;
 pub mod probe;
 pub mod store;
+mod tasks;
 pub mod types;
 
 pub use network::RaftNetworkImpl;
 pub use store::{KafStateMachine, KafStorageState};
-pub use types::{KafRequest, TypeConfig};
+pub use types::{FailoverSemantics, KafRequest, TypeConfig};
 
 use crate::config::{Config, VipAddr};
+use admission::runtime::RuntimeDriver;
 use anyhow::Context;
-// `WatchReceiver` provides `borrow_watched()` on the metrics watch handle (0.10 renamed the 0.9
-// `borrow()`); it must be in scope for the method to resolve.
+use control::run_cluster_guard;
 use openraft::Raft;
-use openraft::async_runtime::WatchReceiver;
-use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::mpsc;
 
 /// openraft 0.10 makes `Raft` generic over the state-machine type, so the alias must name our
 /// state-machine half. The log-storage half is erased behind the `Raft::new` `LS` type parameter.
 pub type KafRaft = Raft<TypeConfig, KafStateMachine>;
 
-/// How often the designated initializer re-probes peers while waiting to cold-form the cluster.
-const FORMATION_PROBE_INTERVAL: Duration = Duration::from_millis(500);
-
-/// Per-probe wall-clock budget during formation.
-const FORMATION_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
-
-/// Emit a "still waiting" log on the first round and then every Nth round (~10s at 500ms) so a
-/// stuck cold start (no majority reachable) is visible without spamming.
-const FORMATION_LOG_EVERY_ROUNDS: u32 = 20;
-
-/// How often the epoch minter checks whether it must commit the cluster incarnation, and how often
-/// the stale-survivor guard re-probes peers.
-const GUARD_POLL_INTERVAL: Duration = Duration::from_millis(1000);
-
-/// Per-probe wall-clock budget for the stale-survivor guard.
-const GUARD_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+const CONTROL_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Consecutive guard rounds that must all observe a foreign majority before this node resets. The
 /// hold-down avoids acting on a single transient probe round.
 const GUARD_STRIKES_TO_RESET: u32 = 3;
 
-/// Process exit code used when a node resets itself after detecting it is a stale survivor of a
-/// cluster that reformed without it. Non-zero so `Restart=on-failure` supervisors relaunch it blank.
-const STALE_SURVIVOR_EXIT_CODE: i32 = 3;
+/// Fatal consensus-safety condition that requires the composition root to stop all work, unbind
+/// VIPs, and then return a non-zero process status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FatalReason {
+    StaleSurvivor,
+    ConfigMismatch,
+}
+
+impl FatalReason {
+    #[must_use]
+    pub const fn exit_code(self) -> i32 {
+        match self {
+            Self::StaleSurvivor => 3,
+            Self::ConfigMismatch => 4,
+        }
+    }
+}
+
+pub struct RaftControlTasks {
+    runtime: Arc<RuntimeDriver>,
+    shutdown: Arc<AtomicBool>,
+    tasks: Vec<tasks::SupervisedTask>,
+    failure_rx: mpsc::UnboundedReceiver<String>,
+}
+
+impl RaftControlTasks {
+    pub(crate) fn runtime(&self) -> Arc<RuntimeDriver> {
+        self.runtime.clone()
+    }
+
+    pub async fn recv_failure(&mut self) -> Option<String> {
+        self.failure_rx.recv().await
+    }
+
+    pub async fn shutdown(&mut self) -> anyhow::Result<()> {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.runtime.shutdown();
+        tasks::stop_supervised_tasks(
+            std::mem::take(&mut self.tasks),
+            CONTROL_TASK_SHUTDOWN_TIMEOUT,
+        )
+        .await
+    }
+}
 
 /// Build the Raft runtime, start the peer listener, and drive automatic cluster formation.
 ///
@@ -57,34 +86,70 @@ const STALE_SURVIVOR_EXIT_CODE: i32 = 3;
 pub async fn start_raft(
     cfg: Arc<Config>,
     vip_list: Arc<Vec<(VipAddr, String)>>,
-) -> anyhow::Result<(
+    listener: crate::listener::ListenerSource,
+) -> anyhow::Result<StartedRaft> {
+    let raft_cfg = Arc::new(build_openraft_config(&cfg)?);
+    let timing = crate::runtime_permission::LeaseTiming::for_config(&cfg, cfg.vips.len())?;
+    start_raft_runtime(cfg, vip_list, listener, raft_cfg, timing).await
+}
+
+pub type StartedRaft = (
     KafRaft,
     Arc<RaftNetworkImpl>,
     Arc<tokio::sync::RwLock<KafStorageState>>,
-)> {
-    let raft_cfg = openraft::Config {
-        election_timeout_min: cfg.raft.election_timeout_min_ms,
-        election_timeout_max: cfg.raft.election_timeout_max_ms,
-        heartbeat_interval: cfg.raft.heartbeat_interval_ms,
-        ..Default::default()
-    }
-    .validate()
-    .map_err(|e| anyhow::anyhow!("openraft config validate: {e}"))?;
-    let raft_cfg = Arc::new(raft_cfg);
+    mpsc::UnboundedReceiver<FatalReason>,
+    mpsc::UnboundedReceiver<String>,
+    RaftControlTasks,
+);
 
+#[cfg(test)]
+pub(crate) async fn start_raft_for_test(
+    cfg: Arc<Config>,
+    vip_list: Arc<Vec<(VipAddr, String)>>,
+    listener: crate::listener::ListenerSource,
+    timing: crate::runtime_permission::LeaseTiming,
+) -> anyhow::Result<StartedRaft> {
+    let raft_cfg = Arc::new(build_openraft_config(&cfg)?);
+    start_raft_runtime(cfg, vip_list, listener, raft_cfg, timing).await
+}
+
+async fn start_raft_runtime(
+    cfg: Arc<Config>,
+    vip_list: Arc<Vec<(VipAddr, String)>>,
+    listener: crate::listener::ListenerSource,
+    raft_cfg: Arc<openraft::Config>,
+    timing: crate::runtime_permission::LeaseTiming,
+) -> anyhow::Result<StartedRaft> {
     // openraft 0.10 takes the log-storage and state-machine halves as two separate values (no
     // `Adaptor`). Both share one volatile in-memory state; `state_ref` is the third handle used by
     // the transport (epoch fencing) and the VIP reconciliation loop.
-    let (log_store, state_machine, state_ref) = store::new_store(
+    let (log_store, state_machine, state_ref) = store::new_admitted_store(
         vip_list,
         cfg.health.effective_stale_missed_probes(),
         cfg.failback,
         cfg.effective_failback_delay_ticks(),
     );
-    let network = Arc::new(RaftNetworkImpl::new(cfg.clone(), state_ref.clone()));
+    tracing::info!(
+        quarantine_ms = timing.restart_quarantine().as_millis(),
+        vip_activation_ms = (timing.startup_vip_delay()? - timing.restart_quarantine()).as_millis(),
+        startup_safety_wait_ms = timing.startup_vip_delay()?.as_millis(),
+        "runtime admission timing"
+    );
+    let admission = RuntimeDriver::new(
+        cfg.clone(),
+        state_ref.clone(),
+        timing,
+        tokio::time::Instant::now(),
+    )?;
+    let local_replica = admission.local_replica();
+    let network = Arc::new(RaftNetworkImpl::new(
+        cfg.clone(),
+        state_ref.clone(),
+        admission.clone(),
+    )?);
 
     let raft = Raft::new(
-        cfg.node_id,
+        local_replica,
         raft_cfg,
         network.as_ref().clone(),
         log_store,
@@ -92,273 +157,449 @@ pub async fn start_raft(
     )
     .await
     .map_err(|e| anyhow::anyhow!("Raft::new: {:?}", e))?;
+    admission.attach(raft.clone())?;
 
     // Start the transport first so peers can be probed and inbound status probes can be answered,
     // then drive automatic cluster formation.
-    network
-        .start(raft.clone())
+    let network_failure_rx = network
+        .start_with_listener(raft.clone(), listener)
         .await
         .context("raft network start")?;
+    let (fatal_tx, fatal_rx) = mpsc::unbounded_channel();
+    let control_shutdown = Arc::new(AtomicBool::new(false));
+    let (control_failure_tx, control_failure_rx) = mpsc::unbounded_channel();
+    let mut control_tasks = Vec::new();
 
-    // Lifetime: runs until the cluster is formed or an existing one is discovered, or until network
-    // shutdown is requested. Spawned (not awaited) so startup never blocks waiting for a quorum.
+    // Lifetime: admission stays supervised until shutdown and expiry stops the daemon.
     {
-        let cfg = cfg.clone();
-        let raft = raft.clone();
         let network = network.clone();
-        tokio::spawn(async move { auto_form_cluster(cfg, raft, network).await });
-    }
-
-    // Lifetime: runs until shutdown. Commits the per-formation cluster incarnation once this node
-    // leads a freshly formed cluster that has none yet.
-    {
-        let raft = raft.clone();
-        let network = network.clone();
-        let state_ref = state_ref.clone();
-        let node_id = cfg.node_id;
-        tokio::spawn(async move { run_epoch_minter(raft, network, state_ref, node_id).await });
+        let admission = admission.clone();
+        control_tasks.push(tasks::spawn_supervised_task(
+            "runtime admission task",
+            control_shutdown.clone(),
+            control_failure_tx.clone(),
+            tasks::CleanExit::Unexpected,
+            async move { admission.run(network).await },
+        ));
     }
 
     // Lifetime: runs until shutdown. Resets this node (by exiting for a supervisor restart) if it
     // becomes a stale survivor of a cluster that reformed without it.
     {
         let cfg = cfg.clone();
-        let raft = raft.clone();
         let network = network.clone();
         let state_ref = state_ref.clone();
-        tokio::spawn(async move { run_cluster_guard(cfg, raft, network, state_ref).await });
+        control_tasks.push(tasks::spawn_supervised_task(
+            "stale-survivor guard task",
+            control_shutdown.clone(),
+            control_failure_tx,
+            tasks::CleanExit::Allowed,
+            async move {
+                run_cluster_guard(cfg, network, state_ref, fatal_tx).await;
+                Ok(())
+            },
+        ));
     }
 
-    Ok((raft, network, state_ref))
+    Ok((
+        raft,
+        network,
+        state_ref,
+        fatal_rx,
+        network_failure_rx,
+        RaftControlTasks {
+            runtime: admission,
+            shutdown: control_shutdown,
+            tasks: control_tasks,
+            failure_rx: control_failure_rx,
+        },
+    ))
 }
 
-/// Mint a per-formation cluster incarnation from 16 bytes of kernel entropy. Linux-only daemon, so
-/// reading `/dev/urandom` directly avoids pulling in an RNG dependency.
-fn mint_cluster_id() -> std::io::Result<u128> {
-    use std::io::Read;
-    let mut buf = [0u8; 16];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
-    Ok(u128::from_be_bytes(buf))
-}
-
-/// Commit the cluster incarnation exactly once, when this node leads a cluster that has none yet.
-///
-/// Only the leader writes; the state machine keeps the first committed value, so leader churn or
-/// concurrent attempts cannot change a cluster's incarnation. Polls rather than waiting on metrics
-/// edges so a transient `client_write` failure (e.g. momentary loss of leadership) is simply
-/// retried on the next tick.
-async fn run_epoch_minter(
-    raft: KafRaft,
-    network: Arc<RaftNetworkImpl>,
-    state_ref: Arc<RwLock<KafStorageState>>,
-    node_id: u64,
-) {
-    loop {
-        if network.is_shutting_down() {
-            return;
-        }
-        let is_leader = raft.metrics().borrow_watched().current_leader == Some(node_id);
-        let needs_epoch = is_leader && state_ref.read().await.cluster_epoch.is_none();
-        if needs_epoch {
-            match mint_cluster_id() {
-                Ok(cluster_id) => {
-                    match raft
-                        .client_write(KafRequest::ClusterFormed { cluster_id })
-                        .await
-                    {
-                        Ok(_) => {
-                            tracing::info!("committed cluster incarnation {:#034x}", cluster_id)
-                        }
-                        // Benign: lost leadership between the check and the write, or no quorum yet;
-                        // retried on the next tick.
-                        Err(e) => tracing::warn!("commit cluster incarnation: {:?}", e),
-                    }
-                }
-                Err(e) => tracing::error!("mint cluster incarnation: {}", e),
-            }
-        }
-        tokio::time::sleep(GUARD_POLL_INTERVAL).await;
+fn build_openraft_config(cfg: &Config) -> anyhow::Result<openraft::Config> {
+    openraft::Config {
+        election_timeout_min: cfg.raft.election_timeout_min_ms,
+        election_timeout_max: cfg.raft.election_timeout_max_ms,
+        heartbeat_interval: cfg.raft.heartbeat_interval_ms,
+        enable_pre_vote: Some(true),
+        // Diskless restarts replay the live leader's log. Keep each unary AppendEntries batch
+        // comfortably inside the heartbeat-derived RPC budget so a large catch-up batch cannot
+        // time out, reconnect, and retry forever without advancing.
+        max_payload_entries: 32,
+        // A restarted follower has a new boot identity and joins as a new learner.
+        allow_log_reversion: Some(false),
+        ..Default::default()
     }
+    .validate()
+    .map_err(|e| anyhow::anyhow!("openraft config validate: {e}"))
 }
 
-/// Detect that this node is a **stale survivor** — it still holds an old incarnation while a
-/// majority of the roster has reformed under a new one — and reset by exiting for a supervisor
-/// restart (returning blank, it rejoins via replication like any diskless reboot).
-///
-/// Safety of the reset rests on the trigger: the node must (1) hold a committed incarnation,
-/// (2) currently have no leader, and (3) see a **majority of the whole roster** report a *different*
-/// concrete incarnation. Condition (3) is what proves this node is the minority that reformed
-/// around — it can hold nothing committed by that majority, so discarding its state loses nothing.
-/// A healthy follower in a normal election shares its peers' incarnation, so it never triggers.
-async fn run_cluster_guard(
-    cfg: Arc<Config>,
-    raft: KafRaft,
-    network: Arc<RaftNetworkImpl>,
-    state_ref: Arc<RwLock<KafStorageState>>,
-) {
-    let total = cfg.peers.len();
-    let majority = total / 2 + 1;
-    let others: Vec<(u64, String)> = cfg
-        .other_peers()
-        .into_iter()
-        .map(|p| (p.id, p.raft_address.clone()))
-        .collect();
-    let mut strikes: u32 = 0;
-    loop {
-        tokio::time::sleep(GUARD_POLL_INTERVAL).await;
-        if network.is_shutting_down() {
-            return;
-        }
-        // Only an initialized node holding a committed incarnation can be a stale survivor.
-        let Some(local_epoch) = state_ref.read().await.cluster_epoch else {
-            strikes = 0;
-            continue;
-        };
-        // A node that currently sees a leader is participating in a cluster, not stranded.
-        if raft.metrics().borrow_watched().current_leader.is_some() {
-            strikes = 0;
-            continue;
-        }
-        // Leaderless: probe peers and count those reporting a *different* concrete incarnation.
-        let mut foreign = 0usize;
-        for (_peer_id, addr) in &others {
-            if let Ok(resp) = network::probe_peer_status(
-                addr,
-                cfg.node_id,
-                cfg.cluster_secret.as_deref(),
-                Some(local_epoch),
-                cfg.max_frame_bytes,
-                GUARD_PROBE_TIMEOUT,
-            )
-            .await
-            {
-                if resp.reports_foreign_epoch(Some(local_epoch)) {
-                    foreign += 1;
-                }
-            }
-        }
-        if foreign >= majority {
-            strikes = strikes.saturating_add(1);
-            tracing::warn!(
-                "stale cluster incarnation: {} of {} peers report a different cluster ({}/{} strikes)",
-                foreign,
-                total,
-                strikes,
-                GUARD_STRIKES_TO_RESET
-            );
-            if strikes >= GUARD_STRIKES_TO_RESET {
-                tracing::error!(
-                    "stale cluster incarnation confirmed; exiting to rejoin the reformed cluster with fresh state"
-                );
-                std::process::exit(STALE_SURVIVOR_EXIT_CODE);
-            }
-        } else {
-            strikes = 0;
-        }
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::{FailoverSemantics, build_openraft_config};
+    use crate::config::{Config, HealthConfig, PeerConfig, RaftTuneConfig};
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
 
-/// Quorum-gated automatic cluster formation.
-///
-/// Every node runs this; there is no special "bootstrap" node. Safety rests on two facts
-/// (see `ARCHITECTURE.md`):
-/// 1. **Identical-config initialize** — every node calls `Raft::initialize` with the *same*,
-///    cluster-wide identical membership (from `peers`). OpenRaft documents concurrent `initialize`
-///    with the same config as safe; the only unsafe case is *different* configs, which the shared
-///    `peers` roster already rules out. Raft then elects a single leader among the reachable
-///    majority, so any majority can form — or recover — the cluster even if the lowest-id node is
-///    permanently gone (important for diskless/PXE nodes with no state across reboots).
-/// 2. **Quorum gate + existing-cluster check** — a node initializes only after a majority of peers
-///    (including itself) respond uninitialized. A network partition therefore yields at most one
-///    side with a leader (quorum), never two. If any peer reports an existing cluster, the node
-///    joins via replication instead — so a blank-rebooted node rejoins rather than re-forming.
-async fn auto_form_cluster(cfg: Arc<Config>, raft: KafRaft, network: Arc<RaftNetworkImpl>) {
-    match raft.is_initialized().await {
-        Ok(true) => return, // already part of a cluster
-        Ok(false) => {}
-        Err(e) => {
-            tracing::warn!("auto-form: is_initialized failed, skipping: {:?}", e);
-            return;
-        }
-    }
-
-    let members: BTreeMap<u64, openraft::BasicNode> = cfg
-        .peers
-        .iter()
-        .map(|p| {
-            (
-                p.id,
-                openraft::BasicNode {
-                    addr: p.raft_address.clone(),
+    fn control_test_config(second: String, third: String) -> Config {
+        Config {
+            node_id: 1,
+            raft_listen: "127.0.0.1:17001".into(),
+            client_submit_listen: "127.0.0.1:18001".into(),
+            peers: vec![
+                PeerConfig {
+                    id: 1,
+                    raft_address: "127.0.0.1:17001".into(),
+                    client_submit_address: "127.0.0.1:18001".into(),
                 },
-            )
+                PeerConfig {
+                    id: 2,
+                    raft_address: second,
+                    client_submit_address: "127.0.0.1:18002".into(),
+                },
+                PeerConfig {
+                    id: 3,
+                    raft_address: third,
+                    client_submit_address: "127.0.0.1:18003".into(),
+                },
+            ],
+            vips: Vec::new(),
+            health: HealthConfig {
+                command: vec!["/bin/true".into()],
+                interval_ms: 1_000,
+                timeout_ms: 500,
+                stale_secs: Some(3),
+            },
+            raft: RaftTuneConfig::default(),
+            cluster_secret: Some("cluster-test-secret-01234567890123".into()),
+            cluster_secret_file: None,
+            max_frame_bytes: 64 * 1024,
+            submit_timeout_ms: 5_000,
+            address_protocol: crate::config::DEFAULT_VIP_ADDRESS_PROTOCOL,
+            dry_run: true,
+            notify: None,
+            failover_delay_secs: 0,
+            failback: true,
+            failback_delay_secs: 0,
+        }
+    }
+
+    #[test]
+    fn exact_boot_replicas_disallow_follower_log_reversion() {
+        let config = control_test_config("127.0.0.1:17002".into(), "127.0.0.1:17003".into());
+        let raft = build_openraft_config(&config).unwrap();
+
+        assert_eq!(raft.allow_log_reversion, Some(false));
+    }
+
+    #[test]
+    fn diskless_replay_uses_bounded_append_payloads() {
+        let config = control_test_config("127.0.0.1:17002".into(), "127.0.0.1:17003".into());
+        let raft = build_openraft_config(&config).unwrap();
+
+        assert_eq!(raft.max_payload_entries, 32);
+    }
+
+    #[tokio::test]
+    async fn raft_control_tasks_report_unexpected_exit_and_own_shutdown() {
+        let runtime = || {
+            let config = std::sync::Arc::new(control_test_config(
+                "127.0.0.1:17002".into(),
+                "127.0.0.1:17003".into(),
+            ));
+            let (_, _, state) =
+                super::store::new_store(std::sync::Arc::new(Vec::new()), 3, true, 0);
+            let timing = crate::runtime_permission::LeaseTiming::for_config(&config, 0).unwrap();
+            super::RuntimeDriver::new(config, state, timing, tokio::time::Instant::now()).unwrap()
+        };
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (failure_tx, failure_rx) = mpsc::unbounded_channel();
+        let unexpected = super::tasks::spawn_supervised_task(
+            "runtime admission task",
+            shutdown.clone(),
+            failure_tx,
+            super::tasks::CleanExit::Unexpected,
+            async { Ok(()) },
+        );
+        let mut controls = super::RaftControlTasks {
+            runtime: runtime(),
+            shutdown,
+            tasks: vec![unexpected],
+            failure_rx,
+        };
+
+        assert!(
+            controls
+                .recv_failure()
+                .await
+                .unwrap()
+                .contains("runtime admission task exited unexpectedly")
+        );
+        assert!(
+            controls
+                .shutdown()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("runtime admission task")
+        );
+
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (failure_tx, failure_rx) = mpsc::unbounded_channel();
+        let expected = super::tasks::spawn_supervised_task(
+            "cluster guard",
+            shutdown.clone(),
+            failure_tx,
+            super::tasks::CleanExit::Allowed,
+            async { Ok(()) },
+        );
+        let mut controls = super::RaftControlTasks {
+            runtime: runtime(),
+            shutdown,
+            tasks: vec![expected],
+            failure_rx,
+        };
+        tokio::task::yield_now().await;
+
+        assert!(controls.failure_rx.try_recv().is_err());
+        controls.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn fatal_reasons_keep_distinct_supervisor_exit_codes() {
+        assert_eq!(super::FatalReason::StaleSurvivor.exit_code(), 3);
+        assert_eq!(super::FatalReason::ConfigMismatch.exit_code(), 4);
+    }
+
+    async fn runtime_control_node() -> (
+        std::sync::Arc<Config>,
+        super::KafRaft,
+        std::sync::Arc<super::RaftNetworkImpl>,
+        std::sync::Arc<tokio::sync::RwLock<super::KafStorageState>>,
+        super::RaftControlTasks,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let mut config = control_test_config(String::new(), String::new());
+        config.peers.truncate(1);
+        config.raft_listen = address.clone();
+        config.peers[0].raft_address = address;
+        let config = std::sync::Arc::new(config);
+        let (raft, network, state, _, _, controls) = super::start_raft(
+            config.clone(),
+            std::sync::Arc::new(Vec::new()),
+            crate::listener::ListenerSource::Bound(listener),
+        )
+        .await
+        .unwrap();
+        (config, raft, network, state, controls)
+    }
+
+    async fn wait_for_runtime_genesis(
+        raft: &super::KafRaft,
+        state: &tokio::sync::RwLock<super::KafStorageState>,
+    ) {
+        use openraft::async_runtime::WatchReceiver;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut metrics = raft.metrics();
+            loop {
+                let _ = metrics.borrow_watched();
+                if state.read().await.genesis.is_some() {
+                    return;
+                }
+                metrics.changed().await.unwrap();
+            }
         })
-        .collect();
-    let total = cfg.peers.len();
-    let others: Vec<(u64, String)> = cfg
-        .other_peers()
-        .into_iter()
-        .map(|p| (p.id, p.raft_address.clone()))
-        .collect();
+        .await
+        .unwrap();
+    }
 
-    let mut rounds: u32 = 0;
-    loop {
-        if network.is_shutting_down() {
-            return;
+    #[tokio::test(start_paused = true)]
+    async fn runtime_controls_initialize_exact_genesis_and_both_capabilities() {
+        let (config, raft, network, state, mut controls) = runtime_control_node().await;
+        let runtime = controls.runtime();
+        let local = runtime.local_replica();
+        let timing = crate::runtime_permission::LeaseTiming::for_config(&config, 0).unwrap();
+        assert!(runtime.current().is_none());
+        assert!(!raft.is_initialized().await.unwrap());
+        assert!(state.read().await.log.is_empty());
+
+        tokio::time::advance(timing.restart_quarantine() - Duration::from_nanos(1)).await;
+        assert!(runtime.current().is_none());
+        assert!(!raft.is_initialized().await.unwrap());
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        wait_for_runtime_genesis(&raft, &state).await;
+
+        let genesis = runtime.current().unwrap().context().genesis.clone();
+        assert_eq!(genesis.config, config.cluster_config_fingerprint().unwrap());
+        assert_eq!(genesis.voters, [local].into());
+        {
+            let state = state.read().await;
+            assert_eq!(state.genesis.as_ref(), Some(&genesis));
+            assert_eq!(state.cluster_epoch, Some(genesis.epoch));
+            assert_eq!(state.failover_semantics, FailoverSemantics::V2);
+            assert!(state.config_identity_enforced);
+            assert!(state.node_health.is_empty());
         }
 
-        let mut reachable_uninit = 1usize; // count self (uninitialized)
-        let mut found_existing = false;
-        for (peer_id, addr) in &others {
-            match network::probe_peer_status(
-                addr,
-                cfg.node_id,
-                cfg.cluster_secret.as_deref(),
-                // We only reach this loop while uninitialized, so we carry no incarnation yet.
-                None,
-                cfg.max_frame_bytes,
-                FORMATION_PROBE_TIMEOUT,
-            )
+        let repeated = raft
+            .client_write(super::KafRequest::AdmissionGenesis(genesis.clone()))
             .await
-            {
-                Ok(resp) if resp.indicates_existing_cluster() => {
-                    tracing::info!(
-                        "peer {} reports an existing cluster; joining via replication instead of forming a new one",
-                        peer_id
-                    );
-                    found_existing = true;
-                    break;
-                }
-                Ok(_) => reachable_uninit += 1,
-                Err(_) => {} // peer not reachable yet; keep waiting
-            }
-        }
+            .unwrap();
+        assert!(matches!(repeated.data, super::types::KafResponse::Ok));
+        let mut foreign = genesis.clone();
+        foreign.epoch ^= 1;
+        let rejected = raft
+            .client_write(super::KafRequest::AdmissionGenesis(foreign))
+            .await
+            .unwrap();
+        assert!(matches!(
+            rejected.data,
+            super::types::KafResponse::Rejected(_)
+        ));
+        assert_eq!(state.read().await.genesis.as_ref(), Some(&genesis));
 
-        match probe::formation_decision(total, reachable_uninit, found_existing) {
-            probe::FormationDecision::Join => return, // replication will absorb this node
-            probe::FormationDecision::Form => {
-                match raft.initialize(members.clone()).await {
-                    Ok(()) => tracing::info!(
-                        "auto-formed Raft cluster: {} of {} peers reachable and uninitialized",
-                        reachable_uninit,
-                        total
-                    ),
-                    // Benign if another path already initialized us between probe and call.
-                    Err(e) => tracing::warn!("Raft initialize: {:?}", e),
-                }
-                return;
-            }
-            probe::FormationDecision::Wait => {
-                rounds = rounds.wrapping_add(1);
-                if rounds == 1 || rounds.is_multiple_of(FORMATION_LOG_EVERY_ROUNDS) {
-                    tracing::warn!(
-                        "waiting to cold-form cluster: {} of {} peers reachable and uninitialized",
-                        reachable_uninit,
-                        total
-                    );
-                }
-                tokio::time::sleep(FORMATION_PROBE_INTERVAL).await;
-            }
+        controls.shutdown().await.unwrap();
+        network.shutdown().await.unwrap();
+        raft.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runtime_control_shutdown_seals_before_task_cleanup() {
+        use super::network::authorization::AdmissionController;
+
+        let (_, raft, network, state, mut controls) = runtime_control_node().await;
+        let runtime = controls.runtime();
+        let local = runtime.local_replica();
+        let started = tokio::time::Instant::now();
+        controls.shutdown().await.unwrap();
+
+        assert_eq!(tokio::time::Instant::now(), started);
+        assert!(controls.tasks.is_empty());
+        assert!(runtime.current().is_none());
+        assert!(runtime.authorize_raft(local).is_err());
+        assert!(runtime.attach(raft.clone()).is_err());
+        assert!(state.read().await.genesis.is_none());
+        assert!(state.read().await.log.is_empty());
+        assert!(!raft.is_initialized().await.unwrap());
+        assert!(controls.failure_rx.try_recv().is_err());
+        controls.shutdown().await.unwrap();
+        network.shutdown().await.unwrap();
+        raft.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_control_shutdown_does_not_report_a_woken_worker_as_failed() {
+        for _ in 0..64 {
+            let (_, raft, network, _, mut controls) = runtime_control_node().await;
+            tokio::task::yield_now().await;
+            controls.shutdown().await.unwrap();
+            assert!(controls.failure_rx.try_recv().is_err());
+            network.shutdown().await.unwrap();
+            raft.shutdown().await.unwrap();
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runtime_controls_report_driver_exit_as_fatal() {
+        use super::network::authorization::AdmissionController;
+
+        let (_, raft, network, state, mut controls) = runtime_control_node().await;
+        let runtime = controls.runtime();
+        tokio::task::yield_now().await;
+        network.shutdown().await.unwrap();
+        let failure = tokio::time::timeout(Duration::from_secs(1), controls.recv_failure())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(failure.contains("runtime admission task exited unexpectedly"));
+        assert!(runtime.current().is_none());
+        assert!(runtime.authorize_raft(runtime.local_replica()).is_err());
+        assert!(runtime.attach(raft.clone()).is_err());
+        assert!(state.read().await.genesis.is_none());
+        assert!(!raft.is_initialized().await.unwrap());
+        assert!(
+            controls
+                .shutdown()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("runtime admission task")
+        );
+        raft.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cluster_guard_reports_coherent_foreign_epoch_after_hold_down() {
+        let mut listeners = Vec::new();
+        for _ in 0..3 {
+            listeners.push(TcpListener::bind("127.0.0.1:0").await.unwrap());
+        }
+        let addresses: Vec<_> = listeners
+            .iter()
+            .map(|listener| listener.local_addr().unwrap().to_string())
+            .collect();
+        let mut cfg = control_test_config(addresses[1].clone(), addresses[2].clone());
+        cfg.raft_listen = addresses[0].clone();
+        cfg.peers[0].raft_address = addresses[0].clone();
+        let cfg = std::sync::Arc::new(cfg);
+        let mut nodes = Vec::new();
+        for (index, listener) in listeners.into_iter().enumerate() {
+            let mut peer = (*cfg).clone();
+            peer.node_id = index as u64 + 1;
+            peer.raft_listen = addresses[index].clone();
+            let node = super::network::testing::start_transport(
+                std::sync::Arc::new(peer),
+                crate::listener::ListenerSource::Bound(listener),
+            )
+            .await;
+            node.2.write().await.cluster_epoch = Some(if index == 0 { 11 } else { 22 });
+            nodes.push(node);
+        }
+        let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel();
+        let guard = tokio::spawn(super::run_cluster_guard(
+            cfg,
+            nodes[0].1.clone(),
+            nodes[0].2.clone(),
+            fatal_tx,
+        ));
+        let start = tokio::time::Instant::now();
+        let verdict = loop {
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            if let Ok(verdict) = fatal_rx.try_recv() {
+                break verdict;
+            }
+            assert!(start.elapsed() < Duration::from_secs(8));
+            tokio::time::advance(Duration::from_millis(10)).await;
+        };
+        assert_eq!(verdict, super::FatalReason::StaleSurvivor);
+        assert!(start.elapsed() >= super::control::GUARD_POLL_INTERVAL * 3);
+        guard.await.unwrap();
+        for (raft, network, state) in nodes {
+            assert!(!raft.is_initialized().await.unwrap());
+            assert!(state.read().await.log.is_empty());
+            network.shutdown().await.unwrap();
+            raft.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cluster_guard_exits_when_network_has_stopped() {
+        let (config, raft, network, state, mut controls) = runtime_control_node().await;
+        controls.shutdown().await.unwrap();
+        network.shutdown().await.unwrap();
+        let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            super::run_cluster_guard(config, network, state, fatal_tx),
+        )
+        .await
+        .unwrap();
+        assert!(fatal_rx.try_recv().is_err());
+        raft.shutdown().await.unwrap();
     }
 }

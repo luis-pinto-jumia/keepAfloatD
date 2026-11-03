@@ -20,7 +20,7 @@ wait_for_service_exit node-a 10
 wait_for_service_exit node-b 10
 wait_for_service_exit node-c 10
 
-# Bring all three back at once — a genuine concurrent cold start.
+# Bring all three back at once - a genuine concurrent cold start.
 start_service node-a
 start_service node-b
 start_service node-c
@@ -29,6 +29,6 @@ wait_for_service_running node-b 10
 wait_for_service_running node-c 10
 
 # Exactly one cluster forms.
-wait_for_even_over_nodes 45 "${NODES[@]}"
+wait_for_startup_over_nodes 45 "${NODES[@]}"
 assert_unique_holders
 wait_for_single_agreed_leader 15
